@@ -243,6 +243,7 @@ class MainWindow(QMainWindow):
         while self.mixer_lay.count():
             it = self.mixer_lay.takeAt(0)
             if it.widget():
+                it.widget().hide()
                 it.widget().deleteLater()
         self.strip_widgets = []
         self.output_widgets = []
