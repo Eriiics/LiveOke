@@ -45,6 +45,16 @@ Notas técnicas completas: doc del proyecto `claude/vocalchain-notas.md`.
      presencia +2-3 dB 3-5 kHz, aire en 10-12 kHz, dinámico en sibilancia 6-8 kHz si no se usa De-Esser).
    - Ajustar con datos reales: falta modelo de micrófono y la conversación de mezcla en FL Studio.
 
+5. **Dos micrófonos + multihilo** (pedido 7-oct 03:26):
+   - Botón "＋ Mic 2" que crea un segundo canal de entrada ASIO (input 2 de la Scarlett) con **su propia cadena**
+     (puede tener otro Auto-Tune/Pro-Q), sus envíos y su fader. Las dos voces se pueden grabar en la mezcla.
+   - Opción **"Procesamiento multihilo"** en ⚙ Audio (desactivada por defecto): cuando está activa, el motor
+     procesa las cadenas de los canales de entrada en paralelo en hilos de trabajo de tiempo real
+     (pool fijo creado al iniciar, prioridad alta, sincronizado con spin/atomics sin bloqueos ni reservas de
+     memoria; el hilo ASIO reparte los canales, espera a que terminen y después suma buses/salidas).
+     Usarlo solo si con 2 cadenas pesadas (2× Auto-Tune Pro) aparecen cortes; con 1 cadena no aporta.
+   - Mostrar en la barra la CPU por canal y si el multihilo está activo; probar con buffer 32/64.
+
 ## Implementación prevista
 - **Motor (C++)**: `Recorder` en el hilo de audio → FIFO lock-free → hilo escritor (WAV temporal 32f) →
   al parar, convertir a MP3 (LAME vía `lameenc` en Python, o ffmpeg si está). Comandos `rec_start {path,mode}`,
