@@ -1,3 +1,20 @@
+## Estado (7-oct, tarde): v0.3 integrada
+
+Hecho y probado (motor bajo wine + interfaz offscreen + pytest):
+- Pestañas Mezclador · Letra · Grabaciones · Audio. La Letra se despega (⇱) a ventana propia y recuerda
+  posición/monitor; al cerrarla vuelve a la pestaña.
+- Grabación del mix (lo que suena en el monitor) → MP3 en Música\VocalChain, modo Canción/Sesión, info.txt/json,
+  letra.txt, búsqueda en YouTube con confirmación y descarga de la instrumental (yt-dlp). Botón ● REC (Ctrl+R).
+- Pestaña Audio: latencia por plugin con avisos (Auto-Tune Low Latency, 48 kHz, buffer 16), CPU por canal,
+  multihilo opcional (apagado por defecto).
+- Perfiles de voz (Trap duro / Melódico / Natural) para Auto-Tune Pro + Pro-Q 4 y envíos.
+- ＋ Mic: segundo micrófono con su cadena; se puede quitar con ✕.
+- Auto-Key: se lee el texto único "Key/Scale".
+- Ventanas de plugins con título "VocalChain ▸ canal ▸ plugin", color e icono.
+
+Pendiente de verificar en el PC real: grabación con ASIO, valores de Pro-Q 4 aplicados por el perfil,
+multihilo con dos cadenas pesadas, descarga con/sin ffmpeg.
+
 # VocalChain — plan para la próxima sesión (v0.3)
 
 Estado: v0.2 funcionando en el PC de Chacho (motor C++/JUCE + interfaz Python). Carpeta:

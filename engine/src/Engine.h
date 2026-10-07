@@ -7,6 +7,7 @@
 
 #include "ClockBridge.h"
 #include "Mixer.h"
+#include "Recorder.h"
 
 #include <functional>
 #include <map>
@@ -23,6 +24,7 @@ struct AudioSettings
     juce::String pcDevice { "CABLE Output (VB-Audio Virtual Cable)" };   // captura WASAPI del PC
     juce::String streamDevice;        // salida WASAPI para OBS/Discord (vacío = ninguna)
     int pcBufferMs = 10;              // colchón del puente VB-Cable → interfaz
+    bool multithread = false;         // procesar los canales de entrada en paralelo
 };
 
 struct OutputModel
@@ -101,7 +103,7 @@ private:
 
     // plugins
     juce::var pluginParams (Slot& s);
-    void openEditor (const juce::String& stripId, SlotPtr slot);
+    void openEditor (const juce::String& stripName, int colourIndex, SlotPtr slot);
     void closeEditor (const juce::String& uid);
 
     void timerCallback() override;
@@ -113,6 +115,7 @@ private:
     Mixer mixer;
     ClockBridge pcBridge, streamBridge;
     SimplePlayHead playHead;
+    Recorder recorder;
 
     std::unique_ptr<juce::AudioIODeviceType> wasapi;
     std::unique_ptr<juce::AudioIODevice> pcDevice, streamDevice;

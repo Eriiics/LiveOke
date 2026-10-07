@@ -60,6 +60,18 @@ QStatusBar {{ background: {PANEL}; color: {DIM}; }}
 QToolTip {{ background: {PANEL}; color: {TEXT}; border: 1px solid {BORDER}; }}
 QMenu {{ background: {PANEL}; border: 1px solid {BORDER}; }}
 QMenu::item:selected {{ background: {ACCENT}; color: #1a1205; }}
+QTabWidget::pane {{ border: none; border-top: 1px solid {BORDER}; background: {BG}; }}
+QTabBar {{ background: {PANEL}; }}
+QTabBar::tab {{ background: {PANEL}; color: {DIM}; padding: 8px 18px; border: none; border-bottom: 2px solid transparent;
+    font-weight: 600; }}
+QTabBar::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {ACCENT}; background: {BG}; }}
+QTabBar::tab:hover {{ color: {TEXT}; }}
+QTreeWidget {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 6px; alternate-background-color: #1c1f25; }}
+QTreeWidget::item {{ padding: 4px 2px; }}
+QTreeWidget::item:selected {{ background: #2d313a; color: {TEXT}; }}
+QHeaderView::section {{ background: #1c1f25; color: {DIM}; border: none; border-bottom: 1px solid {BORDER}; padding: 5px 6px; }}
+QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 7px; border: 1px solid {BORDER}; background: #23262d; }}
+QRadioButton::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
 """
 
 

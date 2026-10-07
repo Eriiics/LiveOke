@@ -147,10 +147,13 @@ class LyricsWindow(QWidget):
     manual_search = Signal(str, str)
     refetch = Signal()
     next_source = Signal()
+    detach_requested = Signal()     # pasar a ventana flotante (otro monitor)
+    dock_requested = Signal()       # volver a la pestaña Letra
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
-        self.setWindowTitle("Letra — VocalChain")
+        self.docked = False
+        self.setWindowTitle("🎤 Letra — VocalChain")
         self.resize(900, 640)
         self.setObjectName("root")
         self.setStyleSheet(f"QWidget#root {{ background: {theme.BG}; }}")
@@ -246,6 +249,10 @@ class LyricsWindow(QWidget):
         self.ontop = QCheckBox("Siempre visible")
         self.ontop.toggled.connect(self._ontop)
         foot.addWidget(self.ontop)
+        self.dock_btn = QPushButton("⇱ Despegar")
+        self.dock_btn.setToolTip("Sacar la letra a una ventana aparte (para ponerla en el otro monitor)")
+        self.dock_btn.clicked.connect(self._dock_clicked)
+        foot.addWidget(self.dock_btn)
         b = QPushButton("⛶")
         b.setToolTip("Pantalla completa (F11)")
         b.clicked.connect(self._fullscreen)
@@ -264,11 +271,35 @@ class LyricsWindow(QWidget):
             super().keyPressEvent(e)
 
     def _fullscreen(self):
+        if self.docked:
+            self.detach_requested.emit()
+            if self.docked:
+                return
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
     def _ontop(self, on):
+        if self.docked:
+            return   # solo aplica a la ventana flotante
         self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
         self.show()
+
+    def _dock_clicked(self):
+        (self.detach_requested if self.docked else self.dock_requested).emit()
+
+    def set_docked(self, docked: bool):
+        self.docked = docked
+        self.dock_btn.setText("⇱ Despegar" if docked else "⇲ Acoplar")
+        self.dock_btn.setToolTip("Sacar la letra a una ventana aparte (para ponerla en el otro monitor)" if docked
+                                 else "Volver a meter la letra en la pestaña de la ventana principal")
+        self.ontop.setEnabled(not docked)
+
+    def closeEvent(self, e):
+        # cerrar la ventana flotante = devolverla a su pestaña (no se pierde)
+        if not self.docked and not getattr(self, "_really_close", False):
+            e.ignore()
+            self.dock_requested.emit()
+            return
+        super().closeEvent(e)
 
     def _font(self, d):
         self.view.font_size = max(14, min(90, self.view.font_size + d))

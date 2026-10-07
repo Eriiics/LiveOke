@@ -1,23 +1,27 @@
 """Ventana principal: barra superior, mezclador y editor de cadena. El audio lo procesa VocalEngine."""
 from __future__ import annotations
 
+import base64
 import json
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QByteArray, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QSplitter, QToolBar, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSplitter, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 from .. import lyrics as lyr
+from .. import voice_profiles as vp
 from ..music import Key
 from ..nowplaying import NowPlayingWatcher
 from ..remote import CONFIG_DIR, OUTPUTS, EngineError, RemoteEngine, find_vst3
+from .audio_panel import AudioPanel
 from .chain_editor import ChainEditor
 from .lyrics_window import LyricsWindow
+from .recordings_panel import RecordingsPanel
 from .settings_dialog import SettingsDialog
 from .strips import AddBusWidget, OutputWidget, StripWidget
 
@@ -37,6 +41,7 @@ class Bridge(QObject):
     track_changed = Signal(object)
     lyrics_ready = Signal(object, object)   # (track_key, Lyrics)
     engine_started = Signal(bool)
+    profile_done = Signal(str, object)      # (nombre, avisos)
 
 
 class MainWindow(QMainWindow):
@@ -53,21 +58,31 @@ class MainWindow(QMainWindow):
         self._err_count = 0
         self._starting = False
         self._lyric_sources_tried: set[str] = set()
+        self.current_preset = self.engine.settings.get("last_preset", "")
+        self.current_profile = ""
 
         self.bridge = Bridge()
         self.bridge.track_changed.connect(self._on_track_changed)
         self.bridge.lyrics_ready.connect(self._on_lyrics)
         self.bridge.engine_started.connect(self._engine_started)
+        self.bridge.profile_done.connect(self._profile_done)
         self.watcher = NowPlayingWatcher(on_change=self.bridge.track_changed.emit)
         self.lyrics_win = LyricsWindow()
         self.lyrics_win.manual_search.connect(self._manual_search)
         self.lyrics_win.refetch.connect(lambda: self._fetch_lyrics(self.watcher.track, use_cache=False))
         self.lyrics_win.next_source.connect(self._next_lyrics_source)
+        self.lyrics_win.detach_requested.connect(lambda: self._set_lyrics_docked(False))
+        self.lyrics_win.dock_requested.connect(lambda: self._set_lyrics_docked(True))
 
         self._build_toolbar()
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("root")
+        self.tabs.setDocumentMode(True)
+        self.setCentralWidget(self.tabs)
+
+        # --- Mezclador
         root = QWidget()
         root.setObjectName("root")
-        self.setCentralWidget(root)
         lay = QVBoxLayout(root)
         lay.setContentsMargins(10, 10, 10, 10)
         split = QSplitter(Qt.Vertical)
@@ -86,7 +101,45 @@ class MainWindow(QMainWindow):
         self.chain.chain_changed.connect(self._chain_changed)
         split.addWidget(self.chain)
         split.setSizes([560, 300])
+        self.tabs.addTab(root, "🎚 Mezclador")
 
+        # --- Letra (se puede despegar a otra ventana / monitor)
+        self.lyrics_tab = QWidget()
+        self.lyrics_tab.setObjectName("root")
+        self.lyrics_tab_lay = QVBoxLayout(self.lyrics_tab)
+        self.lyrics_tab_lay.setContentsMargins(0, 0, 0, 0)
+        self.lyrics_placeholder = QWidget()
+        pl = QVBoxLayout(self.lyrics_placeholder)
+        pl.addStretch(1)
+        msg = QLabel("La letra está en una ventana aparte.")
+        msg.setAlignment(Qt.AlignCenter)
+        msg.setObjectName("dim")
+        pl.addWidget(msg)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b = QPushButton("⇲ Traerla de vuelta")
+        b.clicked.connect(lambda: self._set_lyrics_docked(True))
+        row.addWidget(b)
+        b = QPushButton("👁 Mostrar ventana")
+        b.clicked.connect(self._show_lyrics)
+        row.addWidget(b)
+        row.addStretch(1)
+        pl.addLayout(row)
+        pl.addStretch(1)
+        self.lyrics_tab_lay.addWidget(self.lyrics_placeholder)
+        self.tabs.addTab(self.lyrics_tab, "🎤 Letra")
+
+        # --- Grabaciones
+        self.rec_panel = RecordingsPanel(self.engine, self._rec_context)
+        self.rec_panel.recording_changed.connect(self._recording_changed)
+        self.tabs.addTab(self.rec_panel, "⏺ Grabaciones")
+
+        # --- Audio
+        self.audio_panel = AudioPanel(self.engine)
+        self.audio_panel.open_settings.connect(self._settings)
+        self.tabs.addTab(self.audio_panel, "🔧 Audio")
+
+        self._set_lyrics_docked(not self.engine.settings.get("lyrics_floating", False), initial=True)
         self.rebuild_mixer()
 
         self.timer = QTimer(self)
@@ -122,14 +175,34 @@ class MainWindow(QMainWindow):
         b = QPushButton("📂 Cargar preset")
         b.clicked.connect(self._load_preset)
         tb.addWidget(b)
-        b = QPushButton("🎤 Letra")
-        b.setToolTip("Abrir la ventana de letras (Ctrl+L)")
-        b.clicked.connect(self._show_lyrics)
-        tb.addWidget(b)
+        self.rec_btn = QPushButton("● REC")
+        self.rec_btn.setCheckable(True)
+        self.rec_btn.setToolTip("Grabar lo que escuchas (Ctrl+R). Modo y nombre en la pestaña Grabaciones.")
+        self.rec_btn.clicked.connect(lambda: self.rec_panel.toggle())
+        tb.addWidget(self.rec_btn)
+        a = QAction(self)
+        a.setShortcut(QKeySequence("Ctrl+R"))
+        a.triggered.connect(lambda: self.rec_panel.toggle())
+        self.addAction(a)
         a = QAction(self)
         a.setShortcut(QKeySequence("Ctrl+L"))
         a.triggered.connect(self._show_lyrics)
         self.addAction(a)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel("  Perfil "))
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItem("— elegir —", None)
+        for prof in vp.PROFILES:
+            self.profile_combo.addItem(f"{prof.emoji} {prof.name}", prof.id)
+            self.profile_combo.setItemData(self.profile_combo.count() - 1, prof.description, Qt.ToolTipRole)
+        self.profile_combo.setToolTip("Perfil de voz: ajusta Auto-Tune Pro y Pro-Q 4 del micrófono y los envíos")
+        self.profile_combo.activated.connect(self._profile_selected)
+        lp = vp.BY_ID.get(self.engine.settings.get("last_profile") or "")
+        if lp:
+            self.profile_combo.setCurrentIndex(max(0, self.profile_combo.findData(lp.id)))
+            self.current_profile = lp.name
+        tb.addWidget(self.profile_combo)
 
         tb.addSeparator()
         tb.addWidget(QLabel("  Tonalidad "))
@@ -192,6 +265,7 @@ class MainWindow(QMainWindow):
             self.strip_widgets.append(w)
         add = AddBusWidget()
         add.add_requested.connect(self._add_bus)
+        add.add_input_requested.connect(self._add_mic)
         self.mixer_lay.addWidget(add)
         self.mixer_lay.addStretch(1)
         a = self.engine.audio
@@ -251,8 +325,30 @@ class MainWindow(QMainWindow):
         if nb:
             self._select(nb)
 
+    def _add_mic(self):
+        mics = [s for s in self.engine.mixer.inputs if s.source == "mic"]
+        used = {c for s in mics for c in s.channels}
+        ch = next((c for c in range(8) if c not in used), 1)
+        name, n = "Mic 2", 2
+        while self.engine.mixer.by_name(name):
+            n += 1
+            name = f"Mic {n}"
+        try:
+            st = self.engine.client.call("add_strip", name=name, kind="input", source="mic", channels=[ch])
+            self.engine.refresh_state()
+        except EngineError as e:
+            QMessageBox.warning(self, "No pude agregar el micrófono", str(e))
+            return
+        ns = self.engine.mixer.strip(st["id"]) if isinstance(st, dict) and "id" in st else self.engine.mixer.by_name(name)
+        if ns:
+            self._select(ns)
+        self.statusBar().showMessage(f"{name} usa la entrada {ch + 1} de la interfaz (cámbiala en su canal). "
+                                     "Si le pones Auto-Tune a los dos, prueba ‘Procesamiento multihilo’ en la pestaña Audio.",
+                                     12000)
+
     def _remove_bus(self, strip):
-        if QMessageBox.question(self, "Quitar bus", f"¿Quitar el bus «{strip.name}»?") == QMessageBox.Yes:
+        what = "el bus" if strip.kind == "bus" else "el canal"
+        if QMessageBox.question(self, "Quitar", f"¿Quitar {what} «{strip.name}» y su cadena?") == QMessageBox.Yes:
             try:
                 self.engine.client.call("remove_strip", strip=strip.id)
                 if self.selected_id == strip.id:
@@ -322,6 +418,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Agregado: " + ", ".join(added), 10000)
 
     def _settings(self):
+        if self.rec_panel.recording:
+            QMessageBox.information(self, "Audio", "Para cambiar la interfaz o el buffer primero para la grabación.")
+            return
         if not self.engine.client.connected:
             QMessageBox.information(self, "Audio", "Primero enciende el motor (⏻ Motor).")
             return
@@ -381,6 +480,7 @@ class MainWindow(QMainWindow):
         self._lyric_sources_tried = set()
         self.lyrics_win.set_track(track)
         self._fetch_lyrics(track)
+        self.rec_panel.on_track_changed(track)
 
     def _fetch_lyrics(self, track, use_cache=True, query: tuple[str, str] | None = None, exclude=None):
         if track is None:
@@ -424,9 +524,63 @@ class MainWindow(QMainWindow):
             self._fetch_lyrics(self.watcher.track, use_cache=False, query=(artist, title))
 
     def _show_lyrics(self):
+        if self.lyrics_win.docked:
+            self.tabs.setCurrentWidget(self.lyrics_tab)
+            return
         self.lyrics_win.show()
         self.lyrics_win.raise_()
         self.lyrics_win.activateWindow()
+
+    def _save_lyrics_geometry(self):
+        w = self.lyrics_win
+        if not w.docked and w.isVisible() and not w.isFullScreen():
+            self.engine.settings["lyrics_geometry"] = base64.b64encode(bytes(w.saveGeometry())).decode("ascii")
+
+    def _set_lyrics_docked(self, docked: bool, initial: bool = False):
+        w = self.lyrics_win
+        if not initial and docked == w.docked:
+            if not docked:
+                self._show_lyrics()
+            return
+        if docked:
+            if not initial:
+                if w.isFullScreen():
+                    w.showNormal()
+                self._save_lyrics_geometry()
+            w.hide()
+            w.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+            w.setParent(self.lyrics_tab, Qt.Widget)
+            self.lyrics_placeholder.hide()
+            self.lyrics_tab_lay.addWidget(w)
+            w.set_docked(True)
+            w.show()
+            if not initial:
+                self.tabs.setCurrentWidget(self.lyrics_tab)
+        else:
+            self.lyrics_tab_lay.removeWidget(w)
+            w.hide()
+            w.setParent(None, Qt.Window)
+            w.setWindowTitle("🎤 Letra — VocalChain")
+            w.set_docked(False)
+            geo = self.engine.settings.get("lyrics_geometry")
+            restored = False
+            if geo:
+                try:
+                    restored = w.restoreGeometry(QByteArray(base64.b64decode(geo)))
+                except Exception:  # noqa: BLE001
+                    restored = False
+            if not restored:
+                w.resize(900, 640)
+            if w.ontop.isChecked():
+                w.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self.lyrics_placeholder.show()
+            w.show()
+            w.raise_()
+            if not initial:
+                self.tabs.setCurrentIndex(0)
+        self.engine.settings["lyrics_floating"] = not docked
+        if not initial:
+            self.engine.save_settings()
 
     # ------------------------------------------------------------------ timers
     def _tick(self):
@@ -437,6 +591,8 @@ class MainWindow(QMainWindow):
             w.tick()
         if self.lyrics_win.isVisible():
             self.lyrics_win.tick(self.watcher.track, self.key_text())
+        if self.rec_btn.isChecked() != self.rec_panel.recording:
+            self.rec_btn.setChecked(self.rec_panel.recording)
 
     def _slow_tick(self):
         k = self.engine.key
@@ -484,6 +640,7 @@ class MainWindow(QMainWindow):
         data.pop("audio", None)  # el preset no cambia tus dispositivos
         data["manual_key"] = [self.engine.manual_key.root, self.engine.manual_key.mode] if self.engine.manual_key else None
         Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._set_preset_name(Path(path).stem)
         self.statusBar().showMessage(f"Preset guardado: {path}", 5000)
 
     def _load_preset(self):
@@ -501,16 +658,124 @@ class MainWindow(QMainWindow):
             self.selected_id = None
             self.engine.refresh_state()
             self._last_key = "force"
+            self._set_preset_name(Path(path).stem)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "Preset", f"No pude cargar el preset: {e}")
 
+    def _set_preset_name(self, name: str):
+        self.current_preset = name
+        self.engine.settings["last_preset"] = name
+        self.engine.save_settings()
+
+    # ------------------------------------------------------------------ perfiles de voz
+    def _mic_slots(self, mic):
+        """{"Auto-Tune Pro": fx, "Pro-Q 4 (antes)": fx, "Pro-Q 4 (después)": fx} según el orden de la cadena."""
+        chain = [fx for fx in mic.chain if fx.is_plugin and not fx.failed]
+        at = next((i for i, fx in enumerate(chain) if fx.looks_like_autotune and "pro" in
+                   f"{fx.plugin_name} {fx.path}".lower()), None)
+        if at is None:
+            at = next((i for i, fx in enumerate(chain) if fx.looks_like_autotune), None)
+        slots = {}
+        if at is not None:
+            slots[vp.AUTOTUNE] = chain[at]
+        eqs = [(i, fx) for i, fx in enumerate(chain) if fx.is_proq]
+        if len(eqs) == 1:
+            slots[vp.EQ_POST] = eqs[0][1]
+        elif eqs:
+            pre = [fx for i, fx in eqs if at is not None and i < at]
+            post = [fx for i, fx in eqs if at is None or i > at]
+            if pre:
+                slots[vp.EQ_PRE] = pre[-1]
+            if post:
+                slots[vp.EQ_POST] = post[0]
+            if not pre and len(post) > 1:
+                slots[vp.EQ_PRE], slots[vp.EQ_POST] = post[0], post[1]
+        return slots
+
+    def _profile_selected(self, idx):
+        pid = self.profile_combo.itemData(idx)
+        prof = vp.BY_ID.get(pid) if pid else None
+        if prof is None:
+            return
+        if not self.engine.client.connected:
+            QMessageBox.information(self, "Perfil", "Primero enciende el motor (⏻ Motor).")
+            return
+        mic = self.engine.mixer.by_name("Mic") or next((s for s in self.engine.mixer.inputs if s.source == "mic"), None)
+        if mic is None:
+            return
+        sel = self.engine.mixer.strip(self.selected_id) if self.selected_id else None
+        if sel is not None and sel.kind == "input" and sel.source == "mic":
+            mic = sel   # aplica al micrófono que tengas seleccionado (Mic o Mic 2)
+        slots = self._mic_slots(mic)
+        if not slots:
+            QMessageBox.information(self, "Perfil", f"La cadena de «{mic.name}» no tiene Auto-Tune Pro ni Pro-Q 4.\n"
+                                    "Agrégalos desde el editor de cadena y vuelve a elegir el perfil.")
+            return
+        self.statusBar().showMessage(f"Aplicando perfil {prof.name} a {mic.name}…")
+
+        def work():
+            data = {}
+            for name, fx in slots.items():
+                params = fx.raw_params(refresh=True)
+                names = [""] * (max((p.index for p in params), default=-1) + 1)
+                for p in params:
+                    names[p.index] = p.name
+                data[name] = (fx, names)
+            warns = vp.apply_profile(prof, data, lambda fx, i, t: fx.set_param_text(i, [t]) is not None)
+            for fx, _ in data.values():
+                fx._raw_cache = None
+            self.bridge.profile_done.emit(prof.id, (mic.id, warns))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _profile_done(self, pid, payload):
+        prof = vp.BY_ID[pid]
+        mic_id, warns = payload
+        mic = self.engine.mixer.strip(mic_id)
+        if mic is not None and prof.sends:
+            sends = dict(mic.sends)
+            for bus_name, level in prof.sends.items():
+                bus = next((b for b in self.engine.mixer.buses if b.name.lower().startswith(bus_name.lower())), None)
+                if bus is not None:
+                    sends[bus.id] = level
+            mic.sends = sends
+            self.rebuild_mixer()
+        self.current_profile = prof.name
+        self.engine.settings["last_profile"] = prof.id
+        self.engine.save_settings()
+        self._last_key = "force"    # volver a poner la tonalidad (el perfil no la toca, pero por si acaso)
+        if warns:
+            self.statusBar().showMessage(f"Perfil {prof.emoji} {prof.name} aplicado con avisos: " + " | ".join(warns[:4]), 15000)
+        else:
+            self.statusBar().showMessage(f"Perfil {prof.emoji} {prof.name} aplicado", 6000)
+
+    # ------------------------------------------------------------------ grabación
+    def _rec_context(self) -> dict:
+        mic = self.engine.mixer.by_name("Mic")
+        preset = self.current_preset or ""
+        if self.current_profile:
+            preset = f"{preset} · perfil {self.current_profile}" if preset else f"perfil {self.current_profile}"
+        k = self.engine.key
+        return {"track": self.watcher.track, "key": k.name if k else "", "preset": preset,
+                "chain": [fx.title for fx in mic.chain if fx.enabled] if mic else []}
+
+    def _recording_changed(self, on: bool):
+        self.rec_btn.setChecked(on)
+        self.rec_btn.setText("■ REC" if on else "● REC")
+        self.rec_btn.setStyleSheet("background: #c62828; color: white; font-weight: 800;" if on else "")
+        self.tabs.setTabText(2, "🔴 Grabando" if on else "⏺ Grabaciones")
+
     # ------------------------------------------------------------------
     def closeEvent(self, e):
+        if self.rec_panel.recording:
+            self.statusBar().showMessage("Guardando la grabación…")
+            self.rec_panel.shutdown()
+        self._save_lyrics_geometry()
         try:
             self.engine.save()
         except Exception as ex:  # noqa: BLE001
             print("No pude guardar:", ex)
         self.watcher.stop()
         self.engine.stop()
+        self.lyrics_win._really_close = True
         self.lyrics_win.close()
         super().closeEvent(e)

@@ -10,7 +10,7 @@ FetchContent_Declare(asiosdk GIT_REPOSITORY https://github.com/audiosdk/asio.git
 FetchContent_MakeAvailable(juce asiosdk)
 
 juce_add_gui_app(VocalEngine PRODUCT_NAME "VocalEngine")
-target_sources(VocalEngine PRIVATE src/Main.cpp src/Engine.cpp)
+target_sources(VocalEngine PRIVATE src/Main.cpp src/Engine.cpp src/Recorder.cpp)
 target_include_directories(VocalEngine PRIVATE src ${asiosdk_SOURCE_DIR}/common)
 target_compile_definitions(VocalEngine PRIVATE
     JUCE_ASIO=1 JUCE_WASAPI=1 JUCE_DIRECTSOUND=0 JUCE_PLUGINHOST_VST3=1 JUCE_PLUGINHOST_VST=0

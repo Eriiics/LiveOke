@@ -25,7 +25,7 @@ for m in $MODS; do
 done
 for p in "${pids[@]}"; do wait $p || { echo "ERROR de compilación"; exit 1; }; done
 pids=()
-for f in Engine Main; do
+for f in Engine Main Recorder; do
   ( $CXX $FLAGS -Wall -c src/$f.cpp -o $OUT/$f.o && echo "ok $f" ) &
   pids+=($!)
 done

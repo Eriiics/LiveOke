@@ -50,13 +50,16 @@ class StripWidget(QFrame):
                                  "Baja la perilla de gain del input en la Focusrite (el aro debe quedar verde, no rojo).")
             self.clip.setStyleSheet("color: #2d313a; font-weight: 800; font-size: 10px;")
             head.addWidget(self.clip)
-        if strip.kind == "bus":
-            rm = _btn("✕", checkable=False, tip="Quitar bus")
+        if strip.kind == "bus" or getattr(strip, "removable", False):
+            rm = _btn("✕", checkable=False, tip="Quitar bus" if strip.kind == "bus" else "Quitar este micrófono")
             rm.clicked.connect(lambda: self.remove_requested.emit(self.strip))
             head.addWidget(rm)
             self.title.mouseDoubleClickEvent = lambda e: self._rename()
         lay.addLayout(head)
-        self.sub = QLabel({"mic": "🎤 Micrófono", "pc": "🔊 Música del PC"}.get(strip.source, "Bus de efectos"))
+        sub = {"mic": "🎤 Micrófono", "pc": "🔊 Música del PC"}.get(strip.source, "Bus de efectos")
+        if strip.kind == "input" and strip.source == "mic" and getattr(strip, "removable", False):
+            sub = "🎙 Micrófono extra"
+        self.sub = QLabel(sub)
         self.sub.setObjectName("dim")
         lay.addWidget(self.sub)
 
@@ -137,6 +140,11 @@ class StripWidget(QFrame):
         self.warn.setObjectName("warn")
         self.warn.setWordWrap(True)
         lay.addWidget(self.warn)
+        self.cpu = QLabel("")
+        self.cpu.setObjectName("dim")
+        self.cpu.setToolTip("CPU de esta cadena: lo que tarda en procesar cada bloque de audio\n"
+                            "comparado con el tiempo disponible (si pasa de ~70% habrá cortes).")
+        lay.addWidget(self.cpu)
 
     # -- volumen de Windows (solo PC) ---------------------------------------
     def _sysvol(self):
@@ -182,6 +190,11 @@ class StripWidget(QFrame):
 
     def tick(self, blocked: set[str]):
         s = self.strip
+        eng = self.engine
+        if eng is not None and getattr(eng, "block_us", 0):
+            pct = 100.0 * s.cpu_us / eng.block_us
+            self.cpu.setText(f"CPU {pct:.0f}% · {s.cpu_us / 1000:.2f} ms" if s.chain else "")
+            self.cpu.setStyleSheet(f"color: {theme.DANGER};" if pct > 70 else "")
         if s.source == "mic":
             clipping = time.monotonic() - s.last_clip < 2.0
             self.clip.setStyleSheet(
@@ -259,6 +272,7 @@ class OutputWidget(QFrame):
 
 class AddBusWidget(QWidget):
     add_requested = Signal()
+    add_input_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -267,5 +281,10 @@ class AddBusWidget(QWidget):
         b.setFixedSize(60, 80)
         b.setToolTip("Agregar un bus de efectos (para envíos)")
         b.clicked.connect(self.add_requested.emit)
+        lay.addWidget(b)
+        b = QPushButton("＋\nMic")
+        b.setFixedSize(60, 80)
+        b.setToolTip("Agregar un segundo micrófono (Input 2 de la Scarlett) con su propia cadena")
+        b.clicked.connect(self.add_input_requested.emit)
         lay.addWidget(b)
         lay.addStretch(1)

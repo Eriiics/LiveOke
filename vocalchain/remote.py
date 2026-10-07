@@ -23,6 +23,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from . import devices as dv
+from . import keyparse
 from .keydetect import KeyDetector
 from .music import NOTE_NAMES, Key
 
@@ -264,6 +265,7 @@ class RemoteFx:
         self.path = d.get("path", "")
         self.plugin_name = d.get("plugin_name", "")
         self.has_editor = d.get("has_editor", False)
+        self.latency = int(d.get("latency", 0) or 0)   # muestras que agrega el plugin
         if self.is_plugin:
             self.values.setdefault("auto_key", self.engine.settings.get("auto_key", {}).get(self.uid, True))
 
@@ -292,6 +294,10 @@ class RemoteFx:
     @property
     def looks_like_autotune(self) -> bool:
         return self.is_plugin and bool(_AUTOTUNE_RE.search(f"{self.plugin_name} {self.path}")) and not self.is_autokey
+
+    @property
+    def is_proq(self) -> bool:
+        return self.is_plugin and bool(re.search(r"pro.?q", f"{self.plugin_name} {self.path}", re.I))
 
     @property
     def is_autokey(self) -> bool:
@@ -382,6 +388,7 @@ class RemoteStrip:
         self.in_peak = 0.0
         self.clip_count = 0
         self.last_clip = 0.0
+        self.cpu_us = 0.0          # tiempo que tarda su cadena por bloque (máximo reciente)
         self.chain: list[RemoteFx] = []
         self.update(d)
 
@@ -456,6 +463,10 @@ class RemoteStrip:
     def sends(self, d):
         self._sends = dict(d)
         self._set(sends={k: float(v) for k, v in d.items()})
+
+    @property
+    def removable(self) -> bool:
+        return self.id not in ("mic", "pc")
 
     @property
     def input_channel(self) -> str:
@@ -665,6 +676,14 @@ class RemoteEngine(QObject):
         return float(self.stats.get("cpu", 0.0) or 0.0)
 
     @property
+    def rec(self) -> dict:
+        return self.stats.get("rec", {}) or {}
+
+    @property
+    def block_us(self) -> float:
+        return 1e6 * self.block / self.sr if self.block else 0.0
+
+    @property
     def total_xruns(self) -> int:
         x = self.stats.get("xruns", 0)
         return max(0, int(x or 0)) + int(self.stats.get("late", 0) or 0)
@@ -778,6 +797,8 @@ class RemoteEngine(QObject):
             if clips > s.clip_count:
                 s.last_clip = now
             s.clip_count = clips
+            cpu = float(v.get("cpu_us", 0.0) or 0.0)
+            s.cpu_us = cpu if cpu >= s.cpu_us else s.cpu_us * 0.9 + cpu * 0.1
         for uid, val in m.get("slots", {}).items():
             for s in self.mixer.strips:
                 for fx in s.chain:
@@ -818,7 +839,7 @@ class RemoteEngine(QObject):
                 for p in params:
                     n = p.name.lower()
                     if re.search(r"\bkey\b", n) and key_txt is None:
-                        key_txt = p.string_value
+                        key_txt = p.string_value          # Auto-Key 2: "Key/Scale" = "A Minor"
                     elif re.search(r"\bscale\b", n) and scale_txt is None:
                         scale_txt = p.string_value
                 self.autokey_params = [(p.name, p.string_value) for p in params[:40]]
@@ -851,29 +872,22 @@ class RemoteEngine(QObject):
             pass
 
 
-def parse_key_text(key_txt: str | None, scale_txt: str | None) -> Key | None:
-    """'A' + 'Minor' → La menor. Acepta 'C#', 'Db', 'C#/Db', 'A minor', 'Am'."""
+def parse_key_text(key_txt: str | None, scale_txt: str | None = None) -> Key | None:
+    """Auto-Key 2 da un solo texto ("A Minor", "Chromatic" mientras escucha). Si el plugin separa
+    tonalidad y escala, se juntan. Devuelve None si todavía no detectó nada."""
     if not key_txt:
         return None
-    t = key_txt.strip()
-    flats = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
-    m = re.match(r"^([A-Ga-g])([#b♯♭]?)\s*(m(?:in(?:or)?)?|maj(?:or)?)?", t)
-    if not m:
+    k = keyparse.parse_key_text(key_txt)
+    if k is None:
         return None
-    name = m.group(1).upper() + m.group(2).replace("♯", "#").replace("♭", "b")
-    name = flats.get(name, name)
-    if name not in NOTE_NAMES:
-        return None
-    mode = "major"
-    tail = (m.group(3) or "").lower()
+    minor = k.minor
     st = (scale_txt or "").lower()
-    if tail.startswith("m") and not tail.startswith("maj"):
-        mode = "minor"
-    if "minor" in st or "menor" in st:
-        mode = "minor"
-    elif "major" in st or "mayor" in st:
-        mode = "major"
-    return Key(NOTE_NAMES.index(name), mode, 0.9)
+    if not re.search(r"(minor|menor|major|mayor|\bm\b|maj)", key_txt.lower()):
+        if "minor" in st or "menor" in st:
+            minor = True
+        elif "major" in st or "mayor" in st:
+            minor = False
+    return Key(k.root, "minor" if minor else "major", 0.9)
 
 
 def find_vst3(extra_dirs: list[str] = ()) -> list[Path]:

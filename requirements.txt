@@ -14,3 +14,5 @@ syncedlyrics>=1.0
 requests>=2.31
 beautifulsoup4>=4.12
 rapidfuzz>=3.6
+lameenc>=1.7
+yt-dlp>=2024.8.6

@@ -1,4 +1,5 @@
 #include "Engine.h"
+#include "PluginWindowStyle.h"
 
 namespace vc
 {
@@ -126,6 +127,8 @@ Engine::Engine()
         st->mute.store (model->mute);
         st->limiter.store (model->limiter);
     }
+    mixer.startWorkers (3);
+    mixer.multithread.store (settings.multithread);
     audioError = openAudio();
     if (audioError.isNotEmpty()) log ("Audio: " + audioError);
     openSecondary();
@@ -136,6 +139,7 @@ Engine::Engine()
 Engine::~Engine()
 {
     stopTimer();
+    if (recorder.isRecording()) recorder.stop();
     saveSession();
     windows.clear();
     closeSecondary();
@@ -341,6 +345,7 @@ void Engine::audioDeviceAboutToStart (juce::AudioIODevice* d)
     sr = d->getCurrentSampleRate();
     block = d->getCurrentBufferSizeSamples();
     playHead.rate.store (sr);
+    if (! recorder.isRecording()) recorder.prepare (sr);
     prepareAll();
     mixer.prepareOutputs (sr, block);
     if (pcActive.load())
@@ -368,10 +373,11 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const* in, int numIn
 {
     const auto t0 = juce::Time::getHighResolutionTicks();
     mixer.process (in, numIn, out, numOut, n, pcActive.load(), pcBridge, streamActive.load() ? &streamBridge : nullptr);
+    if (numOut > 0) recorder.pushBlock (out[0], numOut > 1 ? out[1] : nullptr, n);   // graba lo que escuchas
     playHead.samples.fetch_add (n);
     const double ms = juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0) * 1000.0;
     if (ms > maxProcMs.load()) maxProcMs.store (ms);
-    if (ms > 0.8 * 1000.0 * n / sr) lateBlocks.fetch_add (1);
+    if (ms > 1000.0 * n / sr) lateBlocks.fetch_add (1);   // más que el tiempo del bloque = corte seguro
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +617,8 @@ var Engine::stateJson (bool withState)
     audio.set ("driver_type", settings.driverType).set ("device", settings.device)
          .set ("sample_rate", settings.sampleRate).set ("buffer_size", settings.bufferSize)
          .set ("monitor_left", settings.monitorLeft).set ("pc_device", settings.pcDevice)
-         .set ("stream_device", settings.streamDevice).set ("pc_buffer_ms", settings.pcBufferMs);
+         .set ("stream_device", settings.streamDevice).set ("pc_buffer_ms", settings.pcBufferMs)
+         .set ("multithread", settings.multithread);
     return Obj().set ("version", 1).set ("audio", audio).set ("strips", st)
                 .set ("outputs", Obj().set ("monitor", out (outMonitor)).set ("stream", out (outStream)));
 }
@@ -731,6 +738,7 @@ void Engine::loadSession()
         if (a.hasProperty ("pc_device")) settings.pcDevice = a["pc_device"].toString();
         if (a.hasProperty ("stream_device")) settings.streamDevice = a["stream_device"].toString();
         if ((int) a["pc_buffer_ms"] > 0) settings.pcBufferMs = (int) a["pc_buffer_ms"];
+        settings.multithread = (bool) a["multithread"];
     }
     auto readOut = [] (OutputModel& m, const var& o)
     {
@@ -792,7 +800,7 @@ var Engine::pluginParams (Slot& s)
     return out;
 }
 
-void Engine::openEditor (const String& stripId, SlotPtr slot)
+void Engine::openEditor (const String& stripName, int colourIndex, SlotPtr slot)
 {
     if (auto it = windows.find (slot->uid); it != windows.end())
     {
@@ -804,9 +812,10 @@ void Engine::openEditor (const String& stripId, SlotPtr slot)
     auto* ed = slot->plugin->inst->createEditorIfNeeded();
     if (ed == nullptr) return;
     const String uid = slot->uid;
-    windows[uid] = std::make_unique<PluginWindow> (slot->title() + juce::String::fromUTF8 ("  —  ") + stripId, ed, [this, uid] {
+    windows[uid] = std::make_unique<PluginWindow> (slot->title() + juce::String::fromUTF8 ("  —  ") + stripName, ed, [this, uid] {
         juce::MessageManager::callAsync ([this, uid] { closeEditor (uid); });
     });
+    PluginWindowStyle::apply (*windows[uid], colourIndex, stripName, slot->title());
 }
 
 void Engine::closeEditor (const String& uid)
@@ -852,6 +861,7 @@ var Engine::handle (const var& m)
 
         if (cmd == "set_audio")
         {
+            if (recorder.isRecording()) return fail (juce::String::fromUTF8 ("Detén la grabación antes de cambiar el audio"));
             if (has (m, "driver_type")) settings.driverType = m["driver_type"].toString();
             if (has (m, "device")) settings.device = m["device"].toString();
             if (has (m, "sample_rate")) settings.sampleRate = (double) m["sample_rate"];
@@ -907,6 +917,8 @@ var Engine::handle (const var& m)
             s.kind = m["kind"].toString().isNotEmpty() ? m["kind"].toString() : "bus";
             s.name = m["name"].toString().isNotEmpty() ? m["name"].toString() : "Bus";
             s.inputMode = s.kind == "bus" ? "none" : "asio";
+            s.source = m["source"].toString();
+            if (s.kind == "input" && ! has (m, "channels")) s.channels = { 1 };
             applyStripJson (s, m);
             if (auto* fx = m["fx"].getArray())
                 for (auto& t : *fx)
@@ -933,7 +945,7 @@ var Engine::handle (const var& m)
         if (cmd == "remove_strip")
         {
             if (! s) return fail ("canal no encontrado");
-            if (s->kind != "bus") return fail ("Solo se pueden quitar buses");
+            if (s->id == "mic" || s->id == "pc") return fail ("El canal principal no se puede quitar");
             const String id = s->id;
             for (auto& slot : s->chain) closeEditor (slot->uid);
             strips.erase (std::remove_if (strips.begin(), strips.end(), [&] (const StripModel& x) { return x.id == id; }), strips.end());
@@ -1023,7 +1035,10 @@ var Engine::handle (const var& m)
             if (cmd == "open_editor")
             {
                 if (! slot->plugin->inst->hasEditor()) return fail ("Este plugin no tiene interfaz propia");
-                openEditor (s->name, slot);
+                int colour = 3;
+                if (s->kind == "input")
+                    colour = s->source == "pc" ? 2 : (s->id == "mic" ? 0 : 1);
+                openEditor (s->name, colour, slot);
                 return ok();
             }
             auto& params = slot->plugin->inst->getParameters();
@@ -1064,11 +1079,68 @@ var Engine::handle (const var& m)
                         return ok (Obj().set ("text", txt).set ("value", v));
                     }
                 }
+                // Parámetro continuo (Hz, dB, %, ms…): convertir el número buscando el valor del plugin
+                const String first = m["texts"].getArray() && m["texts"].getArray()->size() > 0 ? (*m["texts"].getArray())[0].toString() : String();
+                const auto numOf = [] (const String& t) { return t.retainCharacters ("0123456789.,-+").replaceCharacter (',', '.').getDoubleValue(); };
+                const bool looksNumeric = first.trim().isNotEmpty() && first.trim().containsOnly ("0123456789.,-+ ");
+                if (looksNumeric)
+                {
+                    const double target = numOf (first);
+                    // 1) lo que el plugin entiende directo
+                    float v = p->getValueForText (first);
+                    double got = numOf (p->getText (v, 64));
+                    if (std::abs (got - target) > std::max (0.02, std::abs (target) * 0.01))
+                    {
+                        // 2) búsqueda binaria (los parámetros continuos son monótonos)
+                        float lo = 0.0f, hi = 1.0f;
+                        const bool rising = numOf (p->getText (1.0f, 64)) >= numOf (p->getText (0.0f, 64));
+                        for (int it = 0; it < 40; ++it)
+                        {
+                            const float mid = 0.5f * (lo + hi);
+                            const double mv = numOf (p->getText (mid, 64));
+                            if ((mv < target) == rising) lo = mid; else hi = mid;
+                        }
+                        v = 0.5f * (lo + hi);
+                        got = numOf (p->getText (v, 64));
+                    }
+                    if (std::abs (got - target) <= std::max (0.05, std::abs (target) * 0.02))
+                    {
+                        p->setValueNotifyingHost (v);
+                        markDirty();
+                        return ok (Obj().set ("text", p->getText (v, 64)).set ("value", v));
+                    }
+                }
                 return fail (juce::String::fromUTF8 ("ningún valor coincide"));
             }
         }
 
         if (cmd == "save") { saveSession(); return ok(); }
+        if (cmd == "set_multithread")
+        {
+            settings.multithread = (bool) m["on"];
+            mixer.multithread.store (settings.multithread);
+            markDirty();
+            return ok();
+        }
+        if (cmd == "rec_start")
+        {
+            String err;
+            if (! recorder.start (juce::File (m["path"].toString()), err)) return fail (err);
+            log ("Grabando en " + m["path"].toString());
+            return ok();
+        }
+        if (cmd == "rec_marker")
+            return ok (Obj().set ("t", recorder.marker (m["name"].toString())));
+        if (cmd == "rec_stop")
+        {
+            auto r = recorder.stop();
+            juce::Array<var> marks;
+            for (auto& mk : r.markers) marks.add (Obj().set ("t", mk.seconds).set ("name", mk.name));
+            log ("Grabación detenida: " + String (r.seconds, 1) + " s, perdidas " + String (r.dropped));
+            if (! r.ok) return fail (r.error);
+            return ok (Obj().set ("seconds", r.seconds).set ("frames", r.frames).set ("dropped", r.dropped)
+                            .set ("path", r.path).set ("markers", marks));
+        }
         if (cmd == "get_session") return ok (stateJson (true));
         if (cmd == "load_session")
         {
@@ -1140,7 +1212,7 @@ void Engine::sendMeters()
     for (auto& s : strips)
     {
         stripsObj.set (s.id.toRawUTF8(), Obj().set ("peak", s.st->peak.exchange (0.0f)).set ("in", s.st->inPeak.exchange (0.0f))
-                                               .set ("clips", s.st->clips.load()));
+                                               .set ("clips", s.st->clips.load()).set ("cpu_us", s.st->procUs.exchange (0.0f)));
         for (auto& slot : s.chain)
             if (slot->fx && String (slot->fx->type()) == "ducker")
                 slotsObj.set (slot->uid.toRawUTF8(), slot->fx->meter.load());
@@ -1161,7 +1233,10 @@ void Engine::sendMeters()
          .set ("pc_active", pcActive.load()).set ("pc_ms", pcBridge.latencyMs (pcRate))
          .set ("pc_under", pcBridge.underruns.load()).set ("pc_over", pcBridge.overruns.load())
          .set ("pc_ratio", pcBridge.currentRatio.load())
-         .set ("stream_active", streamActive.load()).set ("stream_under", streamBridge.underruns.load());
+         .set ("stream_active", streamActive.load()).set ("stream_under", streamBridge.underruns.load())
+         .set ("pc_sr", pcRate).set ("multithread", mixer.multithread.load()).set ("parallel", mixer.lastParallel.load())
+         .set ("rec", Obj().set ("on", recorder.isRecording()).set ("t", recorder.elapsedSeconds())
+                           .set ("dropped", recorder.droppedSamples()));
     sendEvent (juce::JSON::toString (Obj().set ("event", "meters").set ("strips", stripsObj).set ("slots", slotsObj)
                                           .set ("out", Obj().set ("monitor", outJ (mixer.monitorOut)).set ("stream", outJ (mixer.streamOut)))
                                           .set ("stats", stats), true));

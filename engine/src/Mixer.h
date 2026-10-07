@@ -113,6 +113,7 @@ struct StripState
     // medidores
     std::atomic<float> peak { 0 }, inPeak { 0 };
     std::atomic<int> clips { 0 };
+    std::atomic<float> procUs { 0 };       // tiempo de proceso de su cadena (µs, máximo reciente)
     // solo hilo de audio
     juce::LinearSmoothedValue<float> gainSmooth;
 
@@ -168,6 +169,7 @@ public:
 
     ~Mixer()
     {
+        stopWorkers();
         delete current;
         delete pending.exchange (nullptr);
         collectGarbage();
@@ -270,13 +272,18 @@ public:
             anySolo = anySolo || s.st->solo.load();
         }
 
-        // 2) canales de entrada: cadena, fader, ruteo y envíos
+        // 2) canales de entrada: cadena y fader (en paralelo si el multihilo está activo), luego ruteo y envíos
+        const bool parallel = multithread.load (std::memory_order_relaxed) && patch->numInputs >= 2;
+        lastParallel.store (parallel, std::memory_order_relaxed);
+        if (parallel)
+            runInputsParallel (*patch, n, anySolo);
+        else
+            for (int i = 0; i < patch->numInputs; ++i)
+                processStrip (*patch->strips[(size_t) i], n, anySolo, patch->sources);
         for (int i = 0; i < patch->numInputs; ++i)
         {
             auto& s = *patch->strips[(size_t) i];
-            s.work.copyFrom (0, 0, s.raw, 0, 0, n);
-            s.work.copyFrom (1, 0, s.raw, 1, 0, n);
-            runStrip (s, n, anySolo, patch->sources);
+            mixStrip (s, n);
             for (auto& [pos, lvl] : s.sends)
             {
                 const float g = lvl->load (std::memory_order_relaxed);
@@ -290,9 +297,8 @@ public:
         for (size_t i = (size_t) patch->numInputs; i < patch->strips.size(); ++i)
         {
             auto& s = *patch->strips[i];
-            s.work.copyFrom (0, 0, s.raw, 0, 0, n);
-            s.work.copyFrom (1, 0, s.raw, 1, 0, n);
-            runStrip (s, n, anySolo, patch->sources);
+            processStrip (s, n, anySolo, patch->sources);
+            mixStrip (s, n);
         }
 
         // 4) salidas
@@ -320,16 +326,105 @@ public:
 
     OutputState monitorOut, streamOut;
     std::atomic<bool> running { false };
+    std::atomic<bool> multithread { false };   // procesar los canales de entrada en paralelo
+    std::atomic<bool> lastParallel { false };
+
+    /** Arranca los hilos de trabajo (una vez, desde el hilo de mensajes). Quedan dormidos si no se usan. */
+    void startWorkers (int count = 3)
+    {
+        if (! workers.empty()) return;
+        for (int i = 0; i < count; ++i)
+        {
+            workers.push_back (std::make_unique<Worker> (*this, i));
+            workers.back()->startThread (juce::Thread::Priority::highest);
+        }
+    }
+
+    void stopWorkers()
+    {
+        for (auto& w : workers) { w->signalThreadShouldExit(); w->wake.signal(); }
+        for (auto& w : workers) w->stopThread (1000);
+        workers.clear();
+    }
 
 private:
+    // -- multihilo --------------------------------------------------------------
+    struct Worker : public juce::Thread
+    {
+        Worker (Mixer& m, int i) : juce::Thread ("vc-mix-" + juce::String (i)), mixer (m) {}
+        void run() override
+        {
+            while (! threadShouldExit())
+            {
+                wake.wait (50);
+                if (threadShouldExit()) break;
+                mixer.workShare();
+            }
+        }
+        Mixer& mixer;
+        juce::WaitableEvent wake;
+    };
+
+    // job = (generación << 32) | próximo índice. La generación evita que un hilo que despertó tarde
+    // tome trabajo de un bloque que ya terminó.
+    void workShare()
+    {
+        const auto myGen = (juce::uint32) (job.load (std::memory_order_acquire) >> 32);
+        Patch* p = jobPatch.load (std::memory_order_acquire);
+        if (p == nullptr) return;
+        for (;;)
+        {
+            const auto v = job.fetch_add (1, std::memory_order_acq_rel);
+            if ((juce::uint32) (v >> 32) != myGen) break;
+            const int i = (int) (v & 0xffffffffu);
+            if (i >= jobInputs) break;
+            processStrip (*p->strips[(size_t) i], jobN, jobSolo, p->sources);
+            jobLeft.fetch_sub (1, std::memory_order_acq_rel);
+        }
+    }
+
+    void runInputsParallel (Patch& p, int n, bool anySolo)
+    {
+        if (workers.empty())
+        {
+            for (int i = 0; i < p.numInputs; ++i) processStrip (*p.strips[(size_t) i], n, anySolo, p.sources);
+            return;
+        }
+        jobN = n;
+        jobSolo = anySolo;
+        jobInputs = p.numInputs;
+        jobLeft.store (p.numInputs, std::memory_order_relaxed);
+        jobPatch.store (&p, std::memory_order_release);
+        job.store ((juce::uint64) (++jobGen) << 32, std::memory_order_release);
+        const int helpers = std::min ((int) workers.size(), p.numInputs - 1);
+        for (int w = 0; w < helpers; ++w) workers[(size_t) w]->wake.signal();
+        workShare();                                   // el hilo de audio también trabaja
+        while (jobLeft.load (std::memory_order_acquire) > 0)
+            ;                                          // espera breve: los otros canales ya están en curso
+        jobPatch.store (nullptr, std::memory_order_release);
+    }
+
+    std::vector<std::unique_ptr<Worker>> workers;
+    std::atomic<Patch*> jobPatch { nullptr };
+    std::atomic<juce::uint64> job { 0 };
+    std::atomic<int> jobLeft { 0 };
+    juce::uint32 jobGen = 0;
+    int jobInputs = 0;
+    int jobN = 0;
+    bool jobSolo = false;
+
     static void meterMax (std::atomic<float>& m, float v)
     {
         float cur = m.load (std::memory_order_relaxed);
         if (v > cur) m.store (v, std::memory_order_relaxed);
     }
 
-    void runStrip (PatchStrip& s, int n, bool anySolo, const SourceBuffers& src)
+    // Cadena + fader + pan de un canal (solo toca s.work y su StripState: se puede correr en paralelo)
+    void processStrip (PatchStrip& s, int n, bool anySolo, const SourceBuffers& src)
     {
+        const auto t0 = juce::Time::getHighResolutionTicks();
+        s.work.copyFrom (0, 0, s.raw, 0, 0, n);
+        s.work.copyFrom (1, 0, s.raw, 1, 0, n);
         auto* L = s.work.getWritePointer (0);
         auto* R = s.work.getWritePointer (1);
         for (auto& slot : s.chain)
@@ -359,6 +454,15 @@ private:
             pk = std::max (pk, std::max (std::abs (L[i]), std::abs (R[i])));
         }
         meterMax (st.peak, pk);
+        meterMax (st.procUs, (float) (juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0) * 1.0e6));
+    }
+
+    // Suma el canal a las salidas (siempre en el hilo de audio, en orden)
+    void mixStrip (PatchStrip& s, int n)
+    {
+        auto& st = *s.st;
+        const auto* L = s.work.getReadPointer (0);
+        const auto* R = s.work.getReadPointer (1);
         if (st.toMonitor.load())
         {
             monitorBuf.addFrom (0, 0, L, n); monitorBuf.addFrom (1, 0, R, n);
