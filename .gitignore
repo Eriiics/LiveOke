@@ -1,5 +1,7 @@
+*.log
+*.pyc
 .venv/
 __pycache__/
-*.pyc
 engine/build/
-*.log
+installer/*.exe
+installer/stage/
