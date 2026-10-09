@@ -70,6 +70,33 @@ class Param:
                      d.get("decimals", 1))
 
 
+def _other_engines() -> list[int]:
+    """PIDs de VocalEngine.exe abiertos (Windows)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq VocalEngine.exe", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=10, creationflags=0x08000000).stdout
+    except Exception:  # noqa: BLE001
+        return []
+    pids = []
+    for line in out.splitlines():
+        parts = [x.strip('"') for x in line.split('","')]
+        if len(parts) > 1 and parts[0].lower() == "vocalengine.exe" and parts[1].isdigit():
+            pids.append(int(parts[1]))
+    return pids
+
+
+def _kill_engines():
+    if sys.platform != "win32":
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "VocalEngine.exe", "/T"], capture_output=True, timeout=10,
+                       creationflags=0x08000000)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Cliente TCP
 # ---------------------------------------------------------------------------
@@ -91,18 +118,50 @@ class EngineClient(QObject):
 
     # -- conexión -----------------------------------------------------------
     def _try_connect(self) -> bool:
+        """Conecta y verifica que al otro lado está VocalEngine (responde a 'hello')."""
         try:
             s = socket.create_connection(("127.0.0.1", self.port), timeout=0.5)
         except OSError:
             return False
+        try:
+            s.settimeout(3.0)
+            s.sendall(b'{"cmd": "hello", "id": 0}\n')
+            buf, rest, t0 = b"", b"", time.time()
+            while True:
+                if time.time() - t0 > 3.0:
+                    raise OSError("sin respuesta")
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise OSError("cerró la conexión")
+                buf += chunk
+                if b'"VocalEngine"' in buf:
+                    i = buf.index(b'"VocalEngine"')
+                    j = buf.find(b"\n", i)
+                    if j >= 0:
+                        rest = buf[j + 1:]
+                        break
+        except OSError as e:
+            print(f"[motor] el puerto {self.port} no responde como VocalEngine ({e})", flush=True)
+            try:
+                s.close()
+            except OSError:
+                pass
+            self._bad_port = True
+            return False
         s.settimeout(None)
         self.sock = s
         self.connected = True
-        threading.Thread(target=self._reader, args=(s,), daemon=True, name="engine-reader").start()
+        threading.Thread(target=self._reader, args=(s, rest), daemon=True, name="engine-reader").start()
         self.connection_changed.emit(True)
         return True
 
-    def ensure_running(self, wait_s: float = 45.0) -> str | None:
+    @staticmethod
+    def _free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+            t.bind(("127.0.0.1", 0))
+            return t.getsockname()[1]
+
+    def ensure_running(self, wait_s: float = 45.0, _retry: bool = True) -> str | None:
         """Conecta con el motor; si no está abierto, lo lanza. Devuelve un error o None."""
         if self.connected:
             return None
@@ -110,21 +169,50 @@ class EngineClient(QObject):
             return None
         if not ENGINE_EXE.exists():
             return f"No encontré el motor en {ENGINE_EXE}"
+        if getattr(self, "_bad_port", False):
+            # algo ocupa el puerto sin ser un motor sano: cerrar motores colgados y usar otro puerto
+            self._bad_port = False
+            if _other_engines():
+                _kill_engines()
+                time.sleep(1.0)
+            if not self._try_connect():
+                self._bad_port = False
+                self.port = self._free_port()
+                print(f"[motor] uso el puerto {self.port}", flush=True)
         flags = 0
         if sys.platform == "win32":
             flags = 0x00000200 | 0x08000000  # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
         try:
             self.proc = subprocess.Popen([str(ENGINE_EXE), "--port", str(self.port)], cwd=str(ENGINE_EXE.parent),
-                                         creationflags=flags)
+                                         creationflags=flags, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
             return f"No pude abrir el motor: {e}"
+        print(f"[motor] lanzado {ENGINE_EXE} pid={self.proc.pid}", flush=True)
         t0 = time.time()
         while time.time() - t0 < wait_s:   # al abrir puede tardar cargando plugins (iLok, etc.)
             if self._try_connect():
                 return None
-            if self.proc.poll() is not None:
-                return f"El motor se cerró al iniciar (código {self.proc.returncode}). Revisa {CONFIG_DIR / 'engine.log'}"
+            code = self.proc.poll()
+            if code is not None:
+                # Se cerró enseguida: casi siempre es otro VocalEngine.exe colgado (solo se permite uno).
+                stale = _other_engines()
+                print(f"[motor] se cerró al iniciar (código {code}); otros motores abiertos: {stale}", flush=True)
+                if stale and _retry:
+                    _kill_engines()
+                    time.sleep(1.0)
+                    return self.ensure_running(wait_s, _retry=False)
+                return (f"El motor se cerró al iniciar (código {code}). "
+                        + ("Había otro VocalEngine abierto y no pude cerrarlo: ciérralo en el Administrador de "
+                           "tareas. " if stale else "")
+                        + f"Revisa {CONFIG_DIR / 'engine.log'}")
             time.sleep(0.25)
+        if _retry and _other_engines():
+            # abierto pero sin responder: colgado
+            print("[motor] no respondió; cierro motores colgados y reintento", flush=True)
+            _kill_engines()
+            time.sleep(1.0)
+            return self.ensure_running(wait_s, _retry=False)
         return "El motor no respondió a tiempo"
 
     def close(self):
@@ -136,8 +224,7 @@ class EngineClient(QObject):
             except OSError:
                 pass
 
-    def _reader(self, s: socket.socket):
-        buf = b""
+    def _reader(self, s: socket.socket, buf: bytes = b""):
         try:
             while True:
                 chunk = s.recv(65536)

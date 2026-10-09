@@ -49,6 +49,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("VocalChain — cadena vocal y karaoke")
         self.resize(1280, 860)
+        scr = self.screen().availableGeometry() if self.screen() else None
+        if scr is not None:
+            self.resize(min(1280, scr.width() - 40), min(860, scr.height() - 60))
+            self.move(scr.center() - self.rect().center())
         self.engine = engine or RemoteEngine()
         self.engine.state_changed.connect(self._state_changed)
         self.selected_id = None
@@ -370,10 +374,14 @@ class MainWindow(QMainWindow):
 
     def _engine_started(self, ok: bool):
         self._starting = False
+        self._force_errors = not ok      # mostrar siempre por qué no arrancó
         self.play.setChecked(ok)
         self.statusBar().clearMessage()
         self._state_changed()
         self._show_errors()
+        if not ok and self.engine.errors:
+            QMessageBox.warning(self, "Motor de audio", "No pude encender el motor de audio:\n\n"
+                                + "\n".join(self.engine.errors))
         if ok:
             self._first_run_setup()
             self._last_key = "force"
@@ -439,8 +447,12 @@ class MainWindow(QMainWindow):
 
     def _show_errors(self):
         errs = self.engine.errors
-        if len(errs) > self._err_count:
-            self.statusBar().showMessage("⚠ " + " | ".join(errs[self._err_count:]), 15000)
+        if errs and (len(errs) > self._err_count or getattr(self, "_force_errors", False)):
+            new = errs if getattr(self, "_force_errors", False) else errs[self._err_count:]
+            self._force_errors = False
+            self.statusBar().showMessage("⚠ " + " | ".join(new), 30000)
+            for e in new:
+                print("[error]", e, flush=True)
             self._err_count = len(errs)
         elif not errs:
             self._err_count = 0
